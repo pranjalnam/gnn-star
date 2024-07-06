@@ -1,30 +1,33 @@
+
 import argparse
 import os
 import random
+import warnings
 
 import dgl
 import dgl.nn as dglnn
 import numpy as np
+import sklearn.metrics
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchmetrics.functional as MF
-import tqdm
 from dgl.data import AsNodePredDataset
 from dgl.dataloading import (
     DataLoader,
-    MultiLayerFullNeighborSampler,
-    NeighborSampler,
+    MultiLayerNeighborSampler,
 )
 from ogb.nodeproppred import DglNodePropPredDataset
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def fix_seed(seed):
-    '''
+    """
     Args :
         seed : value of the seed
     Function which allows to fix all the seed and get reproducible results
-    '''
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -43,12 +46,12 @@ fix_seed(11)
 
 
 class SAGE(nn.Module):
-    def __init__(self, in_size, hid_size, out_size):
+    def __init__(self, in_size, hid_size, out_size, n_layers):
         super().__init__()
         self.layers = nn.ModuleList()
-        # three-layer GraphSAGE-mean
         self.layers.append(dglnn.SAGEConv(in_size, hid_size, "mean"))
-        self.layers.append(dglnn.SAGEConv(hid_size, hid_size, "mean"))
+        for _ in range(n_layers - 2):
+            self.layers.append(dglnn.SAGEConv(hid_size, hid_size, "mean"))
         self.layers.append(dglnn.SAGEConv(hid_size, out_size, "mean"))
         self.dropout = nn.Dropout(0.5)
         self.hid_size = hid_size
@@ -63,43 +66,6 @@ class SAGE(nn.Module):
                 h = self.dropout(h)
         return h
 
-    def inference(self, g, device, batch_size):
-        """Conduct layer-wise inference to get all the node embeddings."""
-        feat = g.ndata["feat"]
-        sampler = MultiLayerFullNeighborSampler(1, prefetch_node_feats=["feat"])
-        dataloader = DataLoader(
-            g,
-            torch.arange(g.num_nodes()).to(g.device),
-            sampler,
-            device=device,
-            batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=0,
-        )
-        buffer_device = torch.device("cpu")
-        pin_memory = buffer_device != device
-
-        for l, layer in enumerate(self.layers):
-            y = torch.empty(
-                g.num_nodes(),
-                self.hid_size if l != len(self.layers) - 1 else self.out_size,
-                dtype=feat.dtype,
-                device=buffer_device,
-                pin_memory=pin_memory,
-            )
-            feat = feat.to(device)
-            for input_nodes, output_nodes, blocks in tqdm.tqdm(dataloader):
-                x = feat[input_nodes]
-                h = layer(blocks[0], x)  # len(blocks) = 1
-                if l != len(self.layers) - 1:
-                    h = F.relu(h)
-                    h = self.dropout(h)
-                # by design, our output nodes are contiguous
-                y[output_nodes[0]: output_nodes[-1] + 1] = h.to(buffer_device)
-            feat = y
-        return y
-
 
 def evaluate(model, graph, dataloader, num_classes):
     model.eval()
@@ -109,44 +75,23 @@ def evaluate(model, graph, dataloader, num_classes):
         with torch.no_grad():
             x = blocks[0].srcdata["feat"]
             ys.append(blocks[-1].dstdata["label"])
-            y_hats.append(model(blocks, x))
-    return MF.accuracy(
-        torch.cat(y_hats),
-        torch.cat(ys),
-        task="multiclass",
-        num_classes=num_classes,
-    )
-
-
-def layerwise_infer(device, graph, nid, model, num_classes, batch_size):
-    model.eval()
-    with torch.no_grad():
-        pred = model.inference(
-            graph, device, batch_size
-        )  # pred in buffer_device
-        pred = pred[nid]
-        label = graph.ndata["label"][nid].to(pred.device)
-        return MF.accuracy(
-            pred, label, task="multiclass", num_classes=num_classes
-        )
+            y_hats.append(model(blocks, x).argmax(dim=1))
+    ys = torch.cat(ys)
+    y_hats = torch.cat(y_hats)
+    return sklearn.metrics.accuracy_score(ys.cpu().numpy(), y_hats.cpu().numpy())
 
 
 def train(args, device, g, dataset, model, num_classes):
     # create sampler & dataloader
     train_idx = dataset.train_idx.to(device)
     val_idx = dataset.val_idx.to(device)
-    sampler = NeighborSampler(
-        [10, 10, 10],  # fanout for [layer-0, layer-1, layer-2]
-        prefetch_node_feats=["feat"],
-        prefetch_labels=["label"],
-    )
-    use_uva = args.mode == "mixed"
+    test_idx = dataset.test_idx.to(device)
+    sampler = MultiLayerNeighborSampler(fanouts=[args.fanout] * args.n_layers)
     train_dataloader = DataLoader(
         g,
         train_idx,
         sampler,
-        device=device,
-        batch_size=1024,
+        batch_size=args.bs,
         shuffle=True,
         drop_last=False,
     )
@@ -155,22 +100,27 @@ def train(args, device, g, dataset, model, num_classes):
         g,
         val_idx,
         sampler,
-        device=device,
-        batch_size=1024,
+        batch_size=args.bs,
         shuffle=True,
         drop_last=False,
-        num_workers=0,
-        use_uva=use_uva,
     )
 
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
+    test_dataloader = DataLoader(
+        g,
+        test_idx,
+        sampler,
+        batch_size=args.bs,
+        shuffle=False,
+        drop_last=False,
+    )
 
-    for epoch in range(10):
+    opt = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=5e-4)
+
+    for epoch in range(args.n_epochs):
         model.train()
         total_loss = 0
-        for it, (input_nodes, output_nodes, blocks) in enumerate(
-                train_dataloader
-        ):
+        for it, (input_nodes, output_nodes, blocks) in enumerate(train_dataloader):
+            blocks = [b.to(device) for b in blocks]
             x = blocks[0].srcdata["feat"]
             y = blocks[-1].dstdata["label"]
             y_hat = model(blocks, x)
@@ -181,57 +131,45 @@ def train(args, device, g, dataset, model, num_classes):
             total_loss += loss.item()
         acc = evaluate(model, g, val_dataloader, num_classes)
         print(
-            "Epoch {:05d} | Loss {:.4f} | Accuracy {:.4f} ".format(
-                epoch, total_loss / (it + 1), acc.item()
+            "Epoch {:05d} | Loss {:.4f} | Val Accuracy {:.4f} ".format(
+                epoch, total_loss / (it + 1), acc
             )
         )
+
+    acc = evaluate(model, g, test_dataloader, num_classes)
+    print("Test Accuracy {:.4f}".format(acc))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode",
-        default="cpu",
-        choices=["cpu", "mixed", "puregpu"],
-        help="Training mode. 'cpu' for CPU training, 'mixed' for CPU-GPU mixed training, "
-             "'puregpu' for pure-GPU training.",
-    )
-    parser.add_argument(
-        "--dt",
-        type=str,
-        default="float",
-        help="data type(float, bfloat16)",
-    )
+    parser.add_argument("--dataset", type=str, default="ogbn-arxiv")
+    parser.add_argument("--n_epochs", type=int, default=100)
+    parser.add_argument("--bs", type=int, default=1024)
+    parser.add_argument("--fanout", type=int, default=10)
+    parser.add_argument("--n_layers", type=int, default=3)
+    parser.add_argument("--n_hidden", type=int, default=128)
+    parser.add_argument("--seed", type=int, default=11)
+
     args = parser.parse_args()
+    mode = "gpu"
     if not torch.cuda.is_available():
-        args.mode = "cpu"
-    print(f"Training in {args.mode} mode.")
+        mode = "cpu"
+    print(f"Training in {mode} mode.")
 
     # load and preprocess dataset
     print("Loading data")
-    dataset = AsNodePredDataset(DglNodePropPredDataset("ogbn-papers", root='../../dataset'))
+    dataset = AsNodePredDataset(DglNodePropPredDataset(args.dataset, root='../../dataset'))
     g = dataset[0]
-    g = g.to("cuda" if args.mode == "puregpu" else "cpu")
     num_classes = dataset.num_classes
-    device = torch.device("cpu" if args.mode == "cpu" else "cuda")
+    device = torch.device("cpu" if mode == "cpu" else "cuda")
+    g = g.to("cuda" if mode == "gpu" else "cpu")
 
     # create GraphSAGE model
     in_size = g.ndata["feat"].shape[1]
     out_size = dataset.num_classes
-    model = SAGE(in_size, 256, out_size).to(device)
-
-    # convert model and graph to bfloat16 if needed
-    if args.dt == "bfloat16":
-        g = dgl.to_bfloat16(g)
-        model = model.to(dtype=torch.bfloat16)
+    model = SAGE(in_size, args.n_hidden, out_size, args.n_layers).to(device)
 
     # model training
     print("Training...")
     train(args, device, g, dataset, model, num_classes)
 
-    # test the model
-    print("Testing...")
-    acc = layerwise_infer(
-        device, g, dataset.test_idx, model, num_classes, batch_size=4096
-    )
-    print("Test Accuracy {:.4f}".format(acc.item()))
