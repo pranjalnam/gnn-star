@@ -1,9 +1,8 @@
-
 import argparse
 import os
 import random
 import warnings
-
+import uuid
 import dgl
 import dgl.nn as dglnn
 import numpy as np
@@ -18,6 +17,7 @@ from dgl.dataloading import (
 )
 from ogb.nodeproppred import DglNodePropPredDataset
 from tqdm import tqdm
+from monitor.monitor import Monitor
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -141,6 +141,10 @@ def train(args, device, g, dataset, model, num_classes):
 
 
 if __name__ == "__main__":
+    
+    session_id = str(uuid.uuid4().hex)
+    print(f"Session ID - {session_id}")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="ogbn-arxiv")
     parser.add_argument("--n_epochs", type=int, default=100)
@@ -148,9 +152,19 @@ if __name__ == "__main__":
     parser.add_argument("--fanout", type=int, default=10)
     parser.add_argument("--n_layers", type=int, default=3)
     parser.add_argument("--n_hidden", type=int, default=128)
+    parser.add_argument("--monitor", action='store_true')
     parser.add_argument("--seed", type=int, default=11)
-
+   
     args = parser.parse_args()
+
+    if args.monitor:
+        # get process id
+        pid = os.getpid()
+        # launch monitoring script monitor.py in background
+        Monitor(id=session_id, pid=pid)
+
+
+
     mode = "gpu"
     if not torch.cuda.is_available():
         mode = "cpu"
@@ -172,4 +186,5 @@ if __name__ == "__main__":
     # model training
     print("Training...")
     train(args, device, g, dataset, model, num_classes)
+
 
