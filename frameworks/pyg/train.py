@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import uuid
+import warnings
 
 import numpy as np
 import sklearn.metrics
@@ -12,6 +13,8 @@ from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import SAGEConv
 
 from monitor.monitor import Monitor
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def fix_seed(seed):

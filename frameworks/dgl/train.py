@@ -43,9 +43,6 @@ def fix_seed(seed):
     torch.set_num_threads(1)
 
 
-fix_seed(11)
-
-
 class SAGE(nn.Module):
     def __init__(self, in_size, hid_size, out_size, n_layers):
         super().__init__()
@@ -142,6 +139,7 @@ def train(args, device, g, dataset, model, num_classes):
 
 
 if __name__ == "__main__":
+    fix_seed(11)
     
     session_id = str(uuid.uuid4().hex)
     print(f"Session ID - {session_id}")
