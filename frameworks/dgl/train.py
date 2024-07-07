@@ -1,8 +1,9 @@
 import argparse
 import os
 import random
-import warnings
 import uuid
+import warnings
+
 import dgl
 import dgl.nn as dglnn
 import numpy as np
@@ -16,7 +17,7 @@ from dgl.dataloading import (
     MultiLayerNeighborSampler,
 )
 from ogb.nodeproppred import DglNodePropPredDataset
-from tqdm import tqdm
+
 from monitor.monitor import Monitor
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -174,14 +175,13 @@ if __name__ == "__main__":
     print("Loading data")
     dataset = AsNodePredDataset(DglNodePropPredDataset(args.dataset, root='../../dataset'))
     g = dataset[0]
-    num_classes = dataset.num_classes
     device = torch.device("cpu" if mode == "cpu" else "cuda")
     g = g.to("cuda" if mode == "gpu" else "cpu")
 
     # create GraphSAGE model
     in_size = g.ndata["feat"].shape[1]
-    out_size = dataset.num_classes
-    model = SAGE(in_size, args.n_hidden, out_size, args.n_layers).to(device)
+    num_classes = dataset.num_classes
+    model = SAGE(in_size, args.n_hidden, num_classes, args.n_layers).to(device)
 
     # model training
     print("Training...")

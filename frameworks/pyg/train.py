@@ -1,12 +1,17 @@
+import argparse
+import os
+import random
+import uuid
+
 import numpy as np
+import sklearn.metrics
 import torch
 import torch.nn.functional as F
-from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
+from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import SAGEConv
-from tqdm import tqdm
-import random
-import os
+
+from monitor.monitor import Monitor
 
 
 def fix_seed(seed):
@@ -26,127 +31,127 @@ def fix_seed(seed):
     torch.set_num_threads(1)
 
 
-fix_seed(11)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-dataset = PygNodePropPredDataset('ogbn-arxiv', root='../../dataset')
-split_idx = dataset.get_idx_split()
-evaluator = Evaluator(name='ogbn-arxiv')
-data = dataset[0].to(device, 'x', 'y')
-
-train_loader = NeighborLoader(
-    data,
-    input_nodes=split_idx['train'],
-    num_neighbors=[10, 10, 10],
-    batch_size=1024,
-    shuffle=True,
-)
-subgraph_loader = NeighborLoader(
-    data,
-    input_nodes=None,
-    num_neighbors=[-1],
-    batch_size=4096
-)
-
-
 class SAGE(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, num_layers):
         super().__init__()
 
         self.num_layers = num_layers
-
         self.convs = torch.nn.ModuleList()
         self.convs.append(SAGEConv(in_channels, hidden_channels))
         for _ in range(num_layers - 2):
             self.convs.append(SAGEConv(hidden_channels, hidden_channels))
         self.convs.append(SAGEConv(hidden_channels, out_channels))
 
-    def reset_parameters(self):
-        for conv in self.convs:
-            conv.reset_parameters()
-
     def forward(self, x, edge_index):
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
             if i != self.num_layers - 1:
                 x = x.relu()
-                x = F.dropout(x, p=0.5, training=self.training)
+                x = F.dropout(x, p=0.5)
         return x
 
-    def inference(self, x_all):
-        # Compute representations of nodes layer by layer, using *all*
-        # available edges. This leads to faster computation in contrast to
-        # immediately computing the final representations of each batch.
-        for i in range(self.num_layers):
-            xs = []
-            for batch in subgraph_loader:
-                x = x_all[batch.n_id].to(device)
-                edge_index = batch.edge_index.to(device)
-                x = self.convs[i](x, edge_index)
-                x = x[:batch.batch_size]
-                if i != self.num_layers - 1:
-                    x = x.relu()
-                xs.append(x.cpu())
-            x_all = torch.cat(xs, dim=0)
-        return x_all
 
-
-model = SAGE(dataset.num_features, 256, dataset.num_classes, num_layers=3)
-model = model.to(device)
-
-
-def train(epoch):
-    model.train()
-    total_loss = total_correct = 0
-    for batch in train_loader:
-        optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
-        y = batch.y[:batch.batch_size].squeeze()
-        loss = F.cross_entropy(out, y)
-        loss.backward()
-        optimizer.step()
-
-        total_loss += float(loss)
-        total_correct += int(out.argmax(dim=-1).eq(y).sum())
-
-    loss = total_loss / len(train_loader)
-    approx_acc = total_correct / split_idx['train'].size(0)
-
-    return loss, approx_acc
-
-
-@torch.no_grad()
-def test():
+def evaluate(model, g, dataloader, num_classes):
     model.eval()
-
-    out = model.inference(data.x)
-
-    y_true = data.y.cpu()
-    y_pred = out.argmax(dim=-1, keepdim=True)
-
-    train_acc = evaluator.eval({
-        'y_true': y_true[split_idx['train']],
-        'y_pred': y_pred[split_idx['train']],
-    })['acc']
-    val_acc = evaluator.eval({
-        'y_true': y_true[split_idx['valid']],
-        'y_pred': y_pred[split_idx['valid']],
-    })['acc']
-    test_acc = evaluator.eval({
-        'y_true': y_true[split_idx['test']],
-        'y_pred': y_pred[split_idx['test']],
-    })['acc']
-
-    return train_acc, val_acc, test_acc
+    ys = []
+    y_hats = []
+    for it, batch in enumerate(dataloader):
+        with torch.no_grad():
+            out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
+            y = batch.y[:batch.batch_size].squeeze()
+            ys.append(y)
+            y_hats.append(out)
+    ys = torch.cat(ys)
+    y_hats = torch.cat(y_hats)
+    return sklearn.metrics.accuracy_score(ys.cpu().numpy(), y_hats.cpu().numpy())
 
 
-model.reset_parameters()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
+def train(args, device, g, dataset, model, num_classes):
+    train_idx = dataset.train_idx.to(device)
+    val_idx = dataset.val_idx.to(device)
+    test_idx = dataset.test_idx.to(device)
 
-best_val_acc = final_test_acc = 0.0
-for epoch in range(10):
-    loss, acc = train(epoch)
-    train_acc, val_acc, test_acc = test()
-    print(f'Epoch {epoch:05d}, Loss: {loss:.4f}, Accuracy: {val_acc:.4f}')
-_, _, final_test_acc = test()
-print("Test Accuracy {:.4f}".format(final_test_acc))
+    train_loader = NeighborLoader(
+        g,
+        input_nodes=train_idx,
+        num_neighbors=[args.fanout] * args.n_layers,
+        batch_size=args.bs,
+        shuffle=True,
+    )
+
+    val_loader = NeighborLoader(
+        g,
+        input_nodes=val_idx,
+        num_neighbors=[args.fanout] * args.n_layers,
+        batch_size=args.bs,
+        shuffle=True,
+    )
+
+    test_loader = NeighborLoader(
+        g,
+        input_nodes=test_idx,
+        num_neighbors=[args.fanout] * args.n_layers,
+        batch_size=args.bs,
+        shuffle=True,
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=5e-4)
+
+    for epoch in range(args.n_epochs):
+        model.train()
+        total_loss = 0
+        for it, batch in enumerate(train_loader):
+            opt.zero_grad()
+            out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
+            y = batch.y[:batch.batch_size].squeeze()
+            loss = F.cross_entropy(out, y)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+        acc = evaluate(model, g, val_loader, num_classes)
+        print(
+            "Epoch {:05d} | Loss {:.4f} | Val Accuracy {:.4f} ".format(
+                epoch, total_loss / (it + 1), acc
+            )
+        )
+
+    acc = evaluate(model, g, test_loader, num_classes)
+    print("Test Accuracy {:.4f}".format(acc))
+
+
+if __name__ == '__main__':
+    fix_seed(11)
+    session_id = str(uuid.uuid4().hex)
+    print(f"Session ID - {session_id}")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="ogbn-arxiv")
+    parser.add_argument("--n_epochs", type=int, default=100)
+    parser.add_argument("--bs", type=int, default=1024)
+    parser.add_argument("--fanout", type=int, default=10)
+    parser.add_argument("--n_layers", type=int, default=3)
+    parser.add_argument("--n_hidden", type=int, default=128)
+    parser.add_argument("--monitor", action='store_true')
+    parser.add_argument("--seed", type=int, default=11)
+
+    args = parser.parse_args()
+
+    if args.monitor:
+        # get process id
+        pid = os.getpid()
+        # launch monitoring script monitor.py in background
+        Monitor(id=session_id, pid=pid)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dataset = PygNodePropPredDataset(args.dataset, root='../../dataset')
+    split_idx = dataset.get_idx_split()
+    g = dataset[0]
+    g = g.to(device)
+
+    # create GraphSAGE model
+    in_size = g.ndata["feat"].shape[1]
+    num_classes = dataset.num_classes
+    model = SAGE(in_size, args.n_hidden, num_classes, args.n_layers).to(device)
+
+    # model training
+    print("Training...")
+    train(args, device, g, dataset, model, num_classes)
