@@ -57,7 +57,7 @@ def evaluate(model, g, dataloader, num_classes):
     y_hats = []
     for it, batch in enumerate(dataloader):
         with torch.no_grad():
-            out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
+            out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size].argmax(dim=1)
             y = batch.y[:batch.batch_size].squeeze()
             ys.append(y)
             y_hats.append(out)
@@ -67,9 +67,9 @@ def evaluate(model, g, dataloader, num_classes):
 
 
 def train(args, device, g, dataset, model, num_classes):
-    train_idx = dataset.train_idx.to(device)
-    val_idx = dataset.val_idx.to(device)
-    test_idx = dataset.test_idx.to(device)
+    train_idx = split_idx['train'].to(device)
+    val_idx = split_idx['valid'].to(device)
+    test_idx = split_idx['test'].to(device)
 
     train_loader = NeighborLoader(
         g,
@@ -148,7 +148,7 @@ if __name__ == '__main__':
     g = g.to(device)
 
     # create GraphSAGE model
-    in_size = g.ndata["feat"].shape[1]
+    in_size = dataset.num_features
     num_classes = dataset.num_classes
     model = SAGE(in_size, args.n_hidden, num_classes, args.n_layers).to(device)
 

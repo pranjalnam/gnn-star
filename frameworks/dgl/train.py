@@ -164,8 +164,6 @@ if __name__ == "__main__":
         # launch monitoring script monitor.py in background
         Monitor(id=session_id, pid=pid)
 
-
-
     mode = "gpu"
     if not torch.cuda.is_available():
         mode = "cpu"
